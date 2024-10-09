@@ -37,6 +37,7 @@ pub(crate) type PinnedLocalFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
 static SPAWN: OnceLock<fn(PinnedFuture<()>)> = OnceLock::new();
 static SPAWN_LOCAL: OnceLock<fn(PinnedLocalFuture<()>)> = OnceLock::new();
+static POLL_LOCAL: OnceLock<fn()> = OnceLock::new();
 
 /// Errors that can occur when using the executor.
 #[derive(Error, Debug)]
@@ -115,6 +116,25 @@ impl Executor {
         });
         _ = rx.await;
     }
+
+    /// Polls the current async executor until it is stalled.
+    #[cfg_attr(docsrs, doc(cfg(feature = "futures-executor")))]
+    pub fn poll_local() {
+        if let Some(poller) = POLL_LOCAL.get() {
+            poller()
+        } else {
+            #[cfg(all(debug_assertions, feature = "tracing"))]
+            tracing::error!(
+                "At {}, tried to poll the Executor before it had been set.",
+                std::panic::Location::caller()
+            );
+            #[cfg(all(debug_assertions, not(feature = "tracing")))]
+            panic!(
+                "At {}, tried to poll the Executor before it had been set.",
+                std::panic::Location::caller()
+            );
+        }
+    }
 }
 
 impl Executor {
@@ -192,6 +212,8 @@ impl Executor {
     #[cfg(feature = "futures-executor")]
     #[cfg_attr(docsrs, doc(cfg(feature = "futures-executor")))]
     pub fn init_futures_executor() -> Result<(), ExecutorError> {
+        use std::cell::RefCell;
+
         use futures::{
             executor::{LocalPool, ThreadPool},
             task::{LocalSpawnExt, SpawnExt},
@@ -199,7 +221,7 @@ impl Executor {
 
         static THREAD_POOL: OnceLock<ThreadPool> = OnceLock::new();
         thread_local! {
-            static LOCAL_POOL: LocalPool = LocalPool::new();
+            static LOCAL_POOL: RefCell<LocalPool> = RefCell::new(LocalPool::new());
         }
 
         fn get_thread_pool() -> &'static ThreadPool {
@@ -219,8 +241,19 @@ impl Executor {
         SPAWN_LOCAL
             .set(|fut| {
                 LOCAL_POOL.with(|pool| {
-                    let spawner = pool.spawner();
+                    let spawner = pool.borrow().spawner();
                     spawner.spawn_local(fut).expect("failed to spawn future");
+                });
+            })
+            .map_err(|_| ExecutorError::AlreadySet)?;
+        POLL_LOCAL
+            .set(|| {
+                LOCAL_POOL.with(|pool| {
+                    // This method call (or a similar one) is required to make any progress
+                    // But it needs a mutable reference to the pool
+                    // Which means that we cannot spawn any new local tasks in an async block
+                    // That's a big limitation.
+                    pool.borrow_mut().run_until_stalled();
                 });
             })
             .map_err(|_| ExecutorError::AlreadySet)?;
@@ -241,5 +274,50 @@ mod tests {
             _ = rc;
         });
         Executor::spawn(async {});
+    }
+
+    #[cfg(feature = "futures-executor")]
+    #[test]
+    fn can_make_threaded_progress() {
+        use crate::Executor;
+        use std::sync::{atomic::AtomicUsize, Arc};
+        Executor::init_futures_executor().expect("couldn't set executor");
+        let counter = Arc::new(AtomicUsize::new(0));
+        Executor::spawn({
+            let counter = Arc::clone(&counter);
+            async move {
+                assert_eq!(
+                    counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
+                    0
+                );
+            }
+        });
+
+        futures::executor::block_on(Executor::tick());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+
+    #[cfg(feature = "futures-executor")]
+    #[test]
+    fn can_make_local_progress() {
+        use crate::Executor;
+        use std::sync::{atomic::AtomicUsize, Arc};
+        Executor::init_futures_executor().expect("couldn't set executor");
+        let counter = Arc::new(AtomicUsize::new(0));
+        Executor::spawn_local({
+            let counter = Arc::clone(&counter);
+            async move {
+                assert_eq!(
+                    counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel),
+                    0
+                );
+                Executor::spawn_local(async {
+                    // crashy crashy
+                });
+            }
+        });
+
+        Executor::poll_local();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 }
