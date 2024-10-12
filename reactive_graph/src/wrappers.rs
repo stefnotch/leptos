@@ -288,7 +288,6 @@ pub mod read {
     impl<T, S> With for ArcSignal<T, S>
     where
         S: Storage<T>,
-        T: Clone,
     {
         type Value = T;
 
